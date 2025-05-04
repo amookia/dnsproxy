@@ -103,6 +103,9 @@ type Options struct {
 	// PreferIPv6 tells the bootstrapper to prefer IPv6 addresses for an
 	// upstream.
 	PreferIPv6 bool
+
+	// Cloudflare encrypted hello message
+	UseEchTLS bool
 }
 
 // Clone copies o to a new struct.  Note, that this is not a deep clone.
@@ -266,6 +269,9 @@ func urlToUpstream(uu *url.URL, opts *Options) (u Upstream, err error) {
 	case "tls":
 		return newDoT(uu, opts)
 	case "h3", "https":
+		if uu.Host == "cloudflare-dns.com" {
+			opts.UseEchTLS = true
+		}
 		return newDoH(uu, opts)
 	default:
 		return nil, fmt.Errorf("unsupported url scheme: %s", sch)

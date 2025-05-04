@@ -192,6 +192,10 @@ type configuration struct {
 	// lookups of private addresses, including the requests for authority
 	// records, such as SOA and NS.
 	UsePrivateRDNS bool `yaml:"use-private-rdns"`
+
+	// Use encrypred client hello
+	// cloudflare
+	UseEchTLS bool `yaml:"user-ech-tls"`
 }
 
 // parseConfig returns options parsed from the command args or config file.  If
@@ -206,6 +210,7 @@ func parseConfig() (conf *configuration, exitCode int, err error) {
 		RatelimitSubnetLenIPv6: 56,
 		HostsFileEnabled:       true,
 		PendingRequestsEnabled: true,
+		UseEchTLS:              true,
 	}
 
 	err = parseCmdLineOptions(conf)

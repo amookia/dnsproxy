@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"runtime"
 	"sync"
 	"time"
@@ -88,8 +89,17 @@ type dnsOverHTTPS struct {
 
 // newDoH returns the DNS-over-HTTPS Upstream.
 func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
+	var tlsMinVersion uint16 = tls.VersionTLS12
 	addPort(addr, defaultPortDoH)
 
+	var echKey []byte
+	if opts.UseEchTLS {
+		tlsMinVersion = tls.VersionTLS13
+		echKey, err = loadEchKey(addr)
+		if err != nil {
+			fmt.Errorf("error loading ech : {}", err)
+		}
+	}
 	var httpVersions []HTTPVersion
 	if addr.Scheme == "h3" {
 		addr.Scheme = "https"
@@ -97,7 +107,6 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 	} else if httpVersions = opts.HTTPVersions; len(opts.HTTPVersions) == 0 {
 		httpVersions = DefaultHTTPVersions
 	}
-
 	ups := &dnsOverHTTPS{
 		getDialer: newDialerInitializer(addr, opts),
 		addr:      addr,
@@ -115,12 +124,13 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 			// store several caches since the user may be routed to different
 			// servers in case there's load balancing on the server-side.
 			ClientSessionCache: tls.NewLRUClientSessionCache(0),
-			MinVersion:         tls.VersionTLS12,
+			MinVersion:         tlsMinVersion,
 			// #nosec G402 -- TLS certificate verification could be disabled by
 			// configuration.
-			InsecureSkipVerify:    opts.InsecureSkipVerify,
-			VerifyPeerCertificate: opts.VerifyServerCertificate,
-			VerifyConnection:      opts.VerifyConnection,
+			InsecureSkipVerify:             opts.InsecureSkipVerify,
+			VerifyPeerCertificate:          opts.VerifyServerCertificate,
+			VerifyConnection:               opts.VerifyConnection,
+			EncryptedClientHelloConfigList: echKey,
 		},
 		clientMu:     &sync.Mutex{},
 		logger:       opts.Logger,
@@ -438,21 +448,21 @@ func (p *dnsOverHTTPS) createClient() (*http.Client, error) {
 // HTTP3 is enabled in the upstream options).  If this attempt is successful,
 // it returns an HTTP3 transport, otherwise it returns the H1/H2 transport.
 func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
-	dialContext, err := p.getDialer()
-	if err != nil {
-		return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
-	}
+	// dialContext, err := p.getDialer()
+	// if err != nil {
+	// 	return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
+	// }
 
 	// First, we attempt to create an HTTP3 transport.  If the probe QUIC
 	// connection is established successfully, we'll be using HTTP3 for this
 	// upstream.
 	tlsConf := p.tlsConf.Clone()
-	transportH3, err := p.createTransportH3(tlsConf, dialContext)
-	if err == nil {
-		p.logger.Debug("using http/3 for this upstream, quic was faster")
+	// transportH3, err := p.createTransportH3(tlsConf, dialContext)
+	// if err == nil {
+	// 	p.logger.Debug("using http/3 for this upstream, quic was faster")
 
-		return transportH3, nil
-	}
+	// 	return transportH3, nil
+	// }
 
 	p.logger.Debug("got error, switching to http/2 for this upstream", slogutil.KeyError, err)
 
@@ -460,13 +470,20 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 		return nil, errors.Error("HTTP1/1 and HTTP2 are not supported by this upstream")
 	}
 
+	dialer := &net.Dialer{
+		Timeout: 30 * time.Second,
+	}
+
 	transport := &http.Transport{
 		TLSClientConfig:    tlsConf,
 		DisableCompression: true,
-		DialContext:        dialContext,
-		IdleConnTimeout:    transportDefaultIdleConnTimeout,
-		MaxConnsPerHost:    dohMaxConnsPerHost,
-		MaxIdleConns:       dohMaxIdleConns,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Always connect to the target IP on port 80
+			return dialer.DialContext(ctx, network, net.JoinHostPort("104.16.133.229", "443"))
+		},
+		IdleConnTimeout: transportDefaultIdleConnTimeout,
+		MaxConnsPerHost: dohMaxConnsPerHost,
+		MaxIdleConns:    dohMaxIdleConns,
 		// Since we have a custom DialContext, we need to use this field to make
 		// golang http.Client attempt to use HTTP/2. Otherwise, it would only be
 		// used when negotiated on the TLS level.
@@ -716,4 +733,51 @@ func isHTTP3(client *http.Client) (ok bool) {
 	_, ok = client.Transport.(*http3Transport)
 
 	return ok
+}
+
+func lookupHttps(addr *url.URL) ([]dns.RR, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn("cloudflare-ech.com"), dns.TypeHTTPS) // Type 65 for HTTPS record
+
+	c := new(dns.Client)
+
+	// Use a public DNS server (e.g., 8.8.8.8)
+	r, _, err := c.Exchange(m, "8.8.8.8:53")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(r.Answer) == 0 {
+		return nil, err
+	}
+
+	return r.Answer, nil
+}
+
+func extractKey(answers []dns.RR) (string, error) {
+	re := regexp.MustCompile(`ech="([^"]+)"`)
+
+	for _, ans := range answers {
+		matches := re.FindStringSubmatch(ans.String())
+		if len(matches) > 1 {
+			return matches[1], nil
+		}
+	}
+	return "", errors.New("could not find key")
+}
+
+func loadEchKey(addr *url.URL) ([]byte, error) {
+	// call dns 8.8.8.8 to load ech key
+	answers, err := lookupHttps(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// extract key
+	encryptedEchKey, err := extractKey(answers)
+	if err != nil {
+		return nil, err
+	}
+
+	return base64.StdEncoding.DecodeString(encryptedEchKey)
 }
